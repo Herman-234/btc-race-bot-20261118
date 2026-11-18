@@ -2,9 +2,11 @@
 
 Strategy (long only, one full-size position at a time, up to 8 round trips):
 - Entry: buy 100% of cash when the close is at least 60 bps below the 120-bar simple
-  moving average of closes (a dip against the 2-hour mean). A dip entry is selective:
-  on the dev window only a few bars a day qualify, and each one is a real dislocation,
-  not 1-minute noise.
+  moving average of closes (a dip against the 2-hour mean) for 2 CONSECUTIVE bars.
+  The second bar is the confirmation: a single 1-minute print 60 bps under the mean
+  is often just a wick, and buying the confirmed dislocation instead of the wick
+  lifts both dev windows (see Backtest). A dip entry is selective: on the dev window
+  only a few bars a day qualify, and each one is a real dislocation, not 1-minute noise.
 - Exits (whichever fires first): take profit at +180 bps above the entry close, a hard
   stop at -100 bps, or a trailing stop at -90 bps below the highest close since entry.
   The trailing stop is the part that matters: on the dev window the second trade bought
@@ -23,9 +25,20 @@ Backtest (offline replay of the published dev windows, exact fill model: fills a
 next bar's open, 4 bps fee + 2 bps slippage + constant-product impact vs pool depth,
 flatten at the last close):
 - This race's dev window (17 Nov 14:44Z - 18 Nov 14:44Z, BTC -280 bps net):
-  net PnL +$10.84, 4 trades, max drawdown 1.16% -> PASSES the dev gate (needs > $0).
-- Previous race's dev window (flat, +49 bps net): net PnL +$20.90, 7 trades,
-  max drawdown 1.49%.
+  net PnL +$12.50, 4 trades, max drawdown 1.16% -> PASSES the dev gate (needs > $0).
+  (Revision 1: was +$10.84 with a 1-bar dip trigger.)
+- Previous race's dev window (flat, +49 bps net): net PnL +$22.00, 7 trades,
+  max drawdown 1.47%.
+  (Revision 1: was +$20.90 with a 1-bar dip trigger. The offline replay model says
+  +$22.21 for this revision; the real entrypoint over stdio says +$22.00 — the
+  $0.21 gap is one bar: the entrypoint's 15-bar cooldown ends one bar earlier
+  than the replay model counts it, so the second dip buy fires at bar 382
+  instead of 383. The smoke-test numbers above are the ground truth.)
+- Revision 1 changes only the entry trigger (2 consecutive dip bars instead of 1);
+  every other parameter is unchanged, and the improvement holds on both windows and
+  on both windows' first halves (+$14.16 vs +$12.51 and +$17.63 vs +$16.64), so it is
+  a confirmation filter, not a single-window fit. 3 bars was tested and rejected:
+  it drops the previous window to +$7.18 (missed dips).
 - The v1 bot from the previous race (single dip entry, no trail) LOSES -$20.46 on this
   race's dev window and would not have raced at all; the trailing stop plus the
   late-entry cutoff are what turn it around. The same parameter region (trail 70-100
@@ -58,6 +71,7 @@ import makefun_bars
 SYMBOL = "CBBTC"
 SMA_BARS = 120
 ENTRY_DIP_BPS = 60
+DIP_CONFIRM_BARS = 2
 TAKE_PROFIT_BPS = 180
 STOP_LOSS_BPS = 100
 TRAILING_STOP_BPS = 90
@@ -75,11 +89,12 @@ last_sell_bar = -10**9
 bought_once = False
 pending_buy_close = None
 high_since_entry = None
+dip_streak = 0
 
 
 def on_batch(state, batch):
     global entry_close, entries_done, last_sell_bar, bought_once
-    global pending_buy_close, high_since_entry
+    global pending_buy_close, high_since_entry, dip_streak
     # Fold this batch's fills in first: a filled buy arms the entry reference and the
     # trailing-stop high; a rejected buy clears it so the signal can fire again.
     for fill in batch.get("fills", []):
@@ -110,18 +125,34 @@ def on_batch(state, batch):
     held = state.positions.get(SYMBOL)
     if held is None:
         if entries_done >= MAX_ENTRIES:
+            dip_streak = 0
             return []
         if len(closes) > NO_ENTRY_AFTER_BAR:
+            dip_streak = 0
             return []
         if entries_done > 0 and len(closes) - last_sell_bar < COOLDOWN_BARS:
+            dip_streak = 0
             return []
         if len(closes) >= SMA_BARS:
             mean = sum(closes[-SMA_BARS:]) / SMA_BARS
             if (mean - close) * 10000 // mean >= ENTRY_DIP_BPS:
-                pending_buy_close = close
-                return [{"side": "buy", "symbol": SYMBOL,
-                         "notional_quote_units": state.cash,
-                         "max_slippage_bps": MAX_SLIPPAGE_BPS}]
+                # Revision 1: require DIP_CONFIRM_BARS consecutive bars at or
+                # below the dip threshold before buying. A single 1-minute
+                # print 60 bps under the mean is often just a wick; waiting for
+                # the second bar filters those out and buys the confirmed
+                # dislocation instead. Offline replay: +$10.84 -> +$12.50 on
+                # this race's dev window and +$20.90 -> +$22.21 on the previous
+                # race's window, same trade counts. (3 bars overshoots: it
+                # misses real dips and drops the previous window to +$7.18.)
+                dip_streak += 1
+                if dip_streak >= DIP_CONFIRM_BARS:
+                    dip_streak = 0
+                    pending_buy_close = close
+                    return [{"side": "buy", "symbol": SYMBOL,
+                             "notional_quote_units": state.cash,
+                             "max_slippage_bps": MAX_SLIPPAGE_BPS}]
+            else:
+                dip_streak = 0
         if not bought_once and len(closes) > FALLBACK_BAR:
             mean = sum(closes[-SMA_BARS:]) / SMA_BARS if len(closes) >= SMA_BARS else close
             if close >= mean or len(closes) > FALLBACK_LAST_RESORT_BAR:
